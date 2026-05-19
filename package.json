@@ -1,0 +1,59 @@
+{
+  "name": "ccpipe",
+  "version": "0.1.0",
+  "description": "Pipe-style headless wrapper around Claude Code — billed against your subscription, not the API.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "headless",
+    "pipe",
+    "automation"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ypoet/ccpipe.git"
+  },
+  "homepage": "https://github.com/ypoet/ccpipe#readme",
+  "bugs": {
+    "url": "https://github.com/ypoet/ccpipe/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "ccpipe": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "scripts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "prepare": "tsc || true",
+    "prepublishOnly": "tsc",
+    "postinstall": "node scripts/fix-node-pty.mjs",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "commander": "^12.1.0",
+    "node-pty": "^1.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0"
+  }
+}
