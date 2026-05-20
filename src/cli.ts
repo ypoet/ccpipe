@@ -66,7 +66,16 @@ program
     "-s, --system <text>",
     "Extra text appended after the pipe-mode preamble",
   )
-  .option("-v, --verbose", "Print progress info to stderr")
+  .option(
+    "-r, --resume <sid>",
+    "Resume an existing session by id (the basename printed on the " +
+      "[ccpipe] session=<sid> stderr line from a previous run)",
+  )
+  .option(
+    "--quiet-session",
+    "Suppress the [ccpipe] session=<sid> stderr line",
+  )
+  .option("-v, --verbose", "Print extra progress info to stderr")
   .action(async (promptParts: string[], opts) => {
     let prompt = promptParts.join(" ").trim();
 
@@ -119,13 +128,16 @@ program
       pipeModePrompt: opts.pipePrompt !== false,
       appendSystemPrompt: opts.system,
       onEvent,
+      resumeSessionId: opts.resume,
     });
 
-    if (opts.verbose) {
-      process.stderr.write(
-        `[ccpipe] session=${result.sessionId} events=${result.events.length} ` +
-          `timedOut=${result.timedOut}\n`,
-      );
+    if (!opts.quietSession) {
+      // Always emit the real session id so callers can `--resume` later.
+      // Goes to stderr to keep stdout free for piping the actual response.
+      const tail = opts.verbose
+        ? ` events=${result.events.length} timedOut=${result.timedOut}`
+        : "";
+      process.stderr.write(`[ccpipe] session=${result.sessionId}${tail}\n`);
     }
 
     if (result.timedOut && !result.text) {
