@@ -15,7 +15,6 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { execSync } from "node:child_process";
 import * as pty from "node-pty";
@@ -114,11 +113,13 @@ export interface RunResult {
 }
 
 /**
- * cc encodes cwd by replacing '/' with '-' (the leading slash becomes a
- * leading dash). Match exactly so we know which jsonl file to tail.
+ * cc encodes cwd by replacing every character outside [A-Za-z0-9-] with
+ * '-'. So `/data00/home/user.233/some_dir` becomes
+ * `-data00-home-user-233-some-dir` (slash, dot, underscore all become '-').
+ * Match exactly so we know which jsonl file to tail.
  */
 export function encodeCwdForCc(cwd: string): string {
-  return cwd.replaceAll("/", "-");
+  return cwd.replace(/[^a-zA-Z0-9-]/g, "-");
 }
 
 export function sessionJsonlPath(sessionId: string, cwd: string): string {
@@ -136,10 +137,9 @@ function buildSystemAddendum(
 }
 
 function buildClaudeArgs(
-  sessionId: string,
   opts: RunOptions,
   positionalPrompt: string | null,
-  isResume: boolean,
+  resumeSessionId: string | null,
 ): string[] {
   const disallowed =
     opts.disallowedTools ?? DEFAULT_DISALLOWED_TOOLS;
@@ -148,11 +148,18 @@ function buildClaudeArgs(
     opts.appendSystemPrompt,
   );
 
+  // Intentionally NOT passing --session-id: in claude 2.1.x TUI mode it only
+  // sets a separate API/telemetry id, while local persistence still uses a
+  // freshly-generated UUID. We discover that real UUID by snapshotting the
+  // project dir before spawn and watching for a new *.jsonl file (see
+  // discoverNewSessionFile). Tracked upstream as anthropics/claude-code#44607.
+  //
+  // --dangerously-skip-permissions (rather than --permission-mode
+  // bypassPermissions) is the only variant that doesn't pop an interactive
+  // "WARNING: Bypass Permissions mode ... 1. No, exit / 2. Yes, I accept"
+  // dialog at startup, which would freeze a headless PTY forever.
   const args = [
-    "--session-id",
-    sessionId,
-    "--permission-mode",
-    "bypassPermissions",
+    "--dangerously-skip-permissions",
     "--no-chrome",
   ];
   if (disallowed.length > 0) {
@@ -167,13 +174,77 @@ function buildClaudeArgs(
   if (opts.extraArgs && opts.extraArgs.length > 0) {
     args.push(...opts.extraArgs);
   }
-  if (isResume) {
-    args.push("--resume", sessionId);
+  if (resumeSessionId !== null) {
+    args.push("--resume", resumeSessionId);
   }
   if (positionalPrompt !== null) {
     args.push(positionalPrompt);
   }
   return args;
+}
+
+function projectDirFor(cwd: string): string {
+  return path.join(CC_PROJECTS_DIR, encodeCwdForCc(cwd));
+}
+
+function snapshotJsonlFiles(projectDir: string): Set<string> {
+  try {
+    return new Set(
+      fs.readdirSync(projectDir).filter((f) => f.endsWith(".jsonl")),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * Wait for a new *.jsonl file to appear in projectDir that wasn't in
+ * `existing`. Returns the basename-derived sessionId and full path. Throws
+ * if the wait budget is exhausted before any new file appears.
+ */
+async function discoverNewSessionFile(
+  projectDir: string,
+  existing: Set<string>,
+  timeoutMs: number,
+  pollMs = 100,
+): Promise<{ sessionId: string; jsonlPath: string }> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    let entries: string[] = [];
+    try {
+      entries = fs.readdirSync(projectDir);
+    } catch {
+      // dir may not exist yet — first time this cwd is used with cc
+    }
+    const newOnes = entries.filter(
+      (f) => f.endsWith(".jsonl") && !existing.has(f),
+    );
+    if (newOnes.length > 0) {
+      // If somehow several new files appear in the same window, pick the
+      // most recently modified — safest bet for "the one we just spawned".
+      let best = newOnes[0];
+      let bestMtime = -Infinity;
+      for (const f of newOnes) {
+        try {
+          const m = fs.statSync(path.join(projectDir, f)).mtimeMs;
+          if (m > bestMtime) {
+            bestMtime = m;
+            best = f;
+          }
+        } catch {
+          // file vanished between readdir and stat — skip
+        }
+      }
+      const sessionId = best.replace(/\.jsonl$/, "");
+      return { sessionId, jsonlPath: path.join(projectDir, best) };
+    }
+    await new Promise((r) => setTimeout(r, pollMs));
+  }
+  throw new Error(
+    `ccpipe: claude did not create a session jsonl in ${projectDir} ` +
+      `within ${timeoutMs}ms. Check that the claude binary works ` +
+      `interactively in this directory (workspace trust dialog, auth, etc.).`,
+  );
 }
 
 function extractText(message: JsonlEvent["message"] | null): string {
@@ -300,10 +371,10 @@ export async function runOnce(
   opts: RunOptions = {},
 ): Promise<RunResult> {
   const cwd = opts.cwd ?? process.cwd();
-  const sessionId = randomUUID();
-  const jsonlPath = sessionJsonlPath(sessionId, cwd);
+  const projectDir = projectDirFor(cwd);
+  const before = snapshotJsonlFiles(projectDir);
 
-  const args = buildClaudeArgs(sessionId, opts, prompt, false);
+  const args = buildClaudeArgs(opts, prompt, null);
 
   const child = pty.spawn(resolveBinary(CLAUDE_BIN), args, {
     name: "xterm-256color",
@@ -320,6 +391,22 @@ export async function runOnce(
   child.onData((data) => {
     if (logStream) logStream.write(data);
   });
+
+  let sessionId: string;
+  let jsonlPath: string;
+  try {
+    ({ sessionId, jsonlPath } = await discoverNewSessionFile(
+      projectDir,
+      before,
+      DEFAULT_STARTUP_WAIT_MS,
+    ));
+  } catch (e) {
+    try {
+      child.kill();
+    } catch {}
+    if (logStream) logStream.end();
+    throw e;
+  }
 
   const events: JsonlEvent[] = [];
   const tailer = new JsonlTailer(jsonlPath);
@@ -392,26 +479,43 @@ export interface SessionOptions extends RunOptions {
  */
 export class Session {
   readonly cwd: string;
-  readonly sessionId: string;
-  readonly jsonlPath: string;
+  /** Populated by ready(); read before then is undefined. */
+  sessionId!: string;
+  /** Populated by ready(); read before then is undefined. */
+  jsonlPath!: string;
 
   private child: pty.IPty;
   private logStream: fs.WriteStream | null;
-  private tailer: JsonlTailer;
+  private tailer!: JsonlTailer;
+  private projectDir: string;
+  private snapshotBefore: Set<string> | null;
   private pending: Map<number, (evt: JsonlEvent) => void>;
   private askLock: Promise<unknown>;
   private closed: boolean;
 
   constructor(opts: SessionOptions = {}) {
     this.cwd = opts.cwd ?? process.cwd();
-    const isResume = !!opts.sessionId;
-    this.sessionId = opts.sessionId ?? randomUUID();
-    this.jsonlPath = sessionJsonlPath(this.sessionId, this.cwd);
+    this.projectDir = projectDirFor(this.cwd);
     this.askLock = Promise.resolve();
     this.pending = new Map();
     this.closed = false;
 
-    const args = buildClaudeArgs(this.sessionId, opts, null, isResume);
+    if (opts.sessionId) {
+      // Resume: we already know the persistence id and file path.
+      this.sessionId = opts.sessionId;
+      this.jsonlPath = sessionJsonlPath(this.sessionId, this.cwd);
+      this.snapshotBefore = null;
+    } else {
+      // Fresh: discover the real persistence id in ready() by watching for
+      // a new jsonl file in the project dir.
+      this.snapshotBefore = snapshotJsonlFiles(this.projectDir);
+    }
+
+    const args = buildClaudeArgs(
+      opts,
+      null,
+      opts.sessionId ?? null,
+    );
 
     this.child = pty.spawn(resolveBinary(CLAUDE_BIN), args, {
       name: "xterm-256color",
@@ -427,19 +531,39 @@ export class Session {
     this.child.onData((data) => {
       if (this.logStream) this.logStream.write(data);
     });
-
-    this.tailer = new JsonlTailer(this.jsonlPath);
   }
 
   /** Wait until cc has created the jsonl file (TUI is alive) or the wait
    * budget elapses. The tailer is then positioned at end-of-file so the
    * first ask() only sees events from its own turn. */
   async ready(opts: { waitMs?: number } = {}): Promise<void> {
-    const deadline = Date.now() + (opts.waitMs ?? DEFAULT_STARTUP_WAIT_MS);
-    while (Date.now() < deadline) {
-      if (fs.existsSync(this.jsonlPath)) break;
-      await new Promise((r) => setTimeout(r, 200));
+    const waitMs = opts.waitMs ?? DEFAULT_STARTUP_WAIT_MS;
+    if (this.snapshotBefore) {
+      // Fresh session: discover the real jsonl that claude creates.
+      let discovered: { sessionId: string; jsonlPath: string };
+      try {
+        discovered = await discoverNewSessionFile(
+          this.projectDir,
+          this.snapshotBefore,
+          waitMs,
+        );
+      } catch (e) {
+        this.close();
+        throw e;
+      }
+      this.sessionId = discovered.sessionId;
+      this.jsonlPath = discovered.jsonlPath;
+      this.snapshotBefore = null;
+    } else {
+      // Resume: the file should already exist; wait briefly in case cc
+      // hasn't reopened it yet.
+      const deadline = Date.now() + waitMs;
+      while (Date.now() < deadline) {
+        if (fs.existsSync(this.jsonlPath)) break;
+        await new Promise((r) => setTimeout(r, 200));
+      }
     }
+    this.tailer = new JsonlTailer(this.jsonlPath);
     this.tailer.jumpToEnd();
     this.tailer.start();
   }
@@ -450,6 +574,9 @@ export class Session {
     opts: { timeoutMs?: number; onEvent?: (e: JsonlEvent) => void } = {},
   ): Promise<RunResult> {
     if (this.closed) throw new Error("Session is closed");
+    if (!this.tailer) {
+      throw new Error("Session: call await ready() before ask()");
+    }
 
     // Serialize asks so two callers can't write into the TUI concurrently.
     const prev = this.askLock;
@@ -512,7 +639,7 @@ export class Session {
   close(): void {
     if (this.closed) return;
     this.closed = true;
-    this.tailer.stop();
+    if (this.tailer) this.tailer.stop();
     try {
       this.child.kill();
     } catch {}
